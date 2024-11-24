@@ -242,6 +242,20 @@ static int extend_url(char **url, const char *baseurl)
     }
 }
 
+static void semgemnt_list_append(hls_media_segment_t** first, hls_media_segment_t** last, hls_media_segment_t* ms)
+{
+    if (*first == NULL)
+    {
+        *first = ms;
+        *last = ms;
+    }
+    else
+    {
+        (*last)->next = ms;
+        ms->prev = *last;
+        *last = ms;
+    }
+}
 
 static char* parse_byterange(char *tag, int64_t *seg_offset, int64_t *seg_size)
 {
@@ -289,13 +303,17 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
             if (!end_pos) {
                 return 0;
             }
+            
+            hls_media_segment_t* map = malloc(sizeof(struct hls_media_segment));
+            memset(map, 0x00, sizeof(struct hls_media_segment));
+            semgemnt_list_append(&me->first_media_segment, &me->last_media_segment, map);
                 
-            ms->url = strndup(tag, end_pos - tag);
-            ms->is_map = true;
-            ms->size = -1;
+            map->url = strndup(tag, end_pos - tag);
+            map->is_map = true;
+            map->size = -1;
             
             if (!strncmp(end_pos+1, ",BYTERANGE=", 11)) {
-                parse_byterange(end_pos+1+11, &ms->offset, &ms->size);
+                parse_byterange(end_pos+1+11, &map->offset, &map->size);
             }
 
             return 0;
@@ -330,7 +348,7 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
     return 0;
 }
 
-static int setup_segment_aes(hls_media_playlist_t *me, hls_media_segment_t *ms)
+static void setup_segment_aes(hls_media_playlist_t *me, hls_media_segment_t *ms)
 {
     if (me->encryptiontype == ENC_AES128 || me->encryptiontype == ENC_AES_SAMPLE) {
         memcpy(ms->enc_aes.key_value, me->enc_aes.key_value, KEYLEN);
@@ -348,8 +366,8 @@ static int setup_segment_aes(hls_media_playlist_t *me, hls_media_segment_t *ms)
 
 static int media_playlist_get_links(hls_media_playlist_t *me)
 {
+    struct hls_media_segment *map = NULL;
     struct hls_media_segment *ms = NULL;
-    struct hls_media_segment *curr_ms = NULL;
     char *src = me->source;
     char* map_uri = NULL;
     int64_t seg_offset = 0;
@@ -376,28 +394,14 @@ static int media_playlist_get_links(hls_media_playlist_t *me)
             if (*src == '#') {
                 parse_tag(me, ms, src, &seg_offset, &seg_size);
                 
-                if (ms->is_map) {
-                    ms->sequence_number = i + me->first_media_sequence;
-                    setup_segment_aes(me, ms);
+                if (me->last_media_segment && me->last_media_segment->is_map) { // new map was given
+                    map = me->last_media_segment;
+                    
+                    map->sequence_number = i + me->first_media_sequence;
+                    setup_segment_aes(me, map);
                     
                     /* Get full url */
-                    extend_url(&(ms->url), me->url);
-                        
-                    /* Add new segment to segment list */
-                    if (me->first_media_segment == NULL)
-                    {
-                        me->first_media_segment = ms;
-                        curr_ms = ms;
-                    }
-                    else
-                    {
-                        curr_ms->next = ms;
-                        ms->prev = curr_ms;
-                        curr_ms = ms;
-                    }
-                    // dont increment sequence number, start next segment with the same SN as the map
-                    ms = NULL;
-                    break;
+                    extend_url(&(map->url), me->url);
                 }
                 
                 continue;                    
@@ -433,17 +437,7 @@ static int media_playlist_get_links(hls_media_playlist_t *me)
                 }
 
                 /* Add new segment to segment list */
-                if (me->first_media_segment == NULL)
-                {
-                    me->first_media_segment = ms;
-                    curr_ms = ms;
-                }
-                else
-                {
-                    curr_ms->next = ms;
-                    ms->prev = curr_ms;
-                    curr_ms = ms;
-                }
+                semgemnt_list_append(&(me->first_media_segment), &(me->last_media_segment), ms);
                 ms = NULL;
                 i += 1;
                 break;
@@ -452,7 +446,6 @@ static int media_playlist_get_links(hls_media_playlist_t *me)
     }
 
 finish:
-    me->last_media_segment = curr_ms;
 
     if (i > 0) {
         me->last_media_sequence = me->first_media_sequence + i - 1;
@@ -1407,12 +1400,15 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 
     void *session = init_hls_session();
     set_timeout_session(session, 2L, 3L);
+    char* current_map_url = NULL;
+    uint64_t current_map_offset = 0;
+    uint64_t current_map_size = -1;
     uint64_t downloaded_duration_ms = 0;
     int64_t download_size = 0;
     time_t repTime = 0;
     bool download = true;
-    while(download) {
 
+    while(download) {
         pthread_mutex_lock(&media_playlist_mtx);
         struct hls_media_segment *ms = me->first_media_segment;
         if (ms != NULL) {
@@ -1436,7 +1432,15 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
             continue;
         }
 
-        MSG_PRINT("Downloading part %d\n", ms->sequence_number);
+        if (ms->is_map) {
+            // don't duplicate map (initial) segment if we have already written it
+            if (current_map_url && !strcmp(ms->url, current_map_url) && ms->offset == current_map_offset && ms->size == current_map_size)
+                goto loop_cleanup;
+            
+            MSG_PRINT("Downloading init segment %s\n", ms->url);
+        } else
+            MSG_PRINT("Downloading part %d\n", ms->sequence_number);
+        
         int retries = 0;
         do {
             struct ByteBuffer seg;
@@ -1455,7 +1459,7 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
                 first_media_sequence = me->first_media_sequence;
                 pthread_mutex_unlock(&media_playlist_mtx);
 
-                if(http_code != 403 && http_code != 401 &&  http_code != 410 && retries <= hls_args.segment_download_retries && (ms->sequence_number > first_media_sequence || ms->is_map)) {
+                if(http_code != 403 && http_code != 401 &&  http_code != 410 && (retries <= hls_args.segment_download_retries && ms->sequence_number > first_media_sequence || ms->is_map)) {
                     clean_http_session(session);
                     sleep(1);
                     session = init_hls_session();
@@ -1499,9 +1503,21 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 
             break;
         } while(true);
+        
+        // remember last written map
+        if (ms->is_map) {
+            free(current_map_url);
+            current_map_url = ms->url;
+            ms->url = NULL;
+            current_map_offset = ms->offset;
+            current_map_size = ms->size;
+        }
 
+loop_cleanup:
         media_segment_cleanup(ms);
     }
+    
+    free(current_map_url);
 
     pthread_join(thread, &ret);
     pthread_mutex_destroy(&media_playlist_mtx);
