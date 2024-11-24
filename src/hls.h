@@ -39,6 +39,7 @@ typedef struct hls_media_segment {
     int64_t offset;
     int64_t size;
     int sequence_number;
+    bool is_map;
     uint64_t duration_ms;
     struct enc_aes128 enc_aes;
     struct hls_media_segment *next;
